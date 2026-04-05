@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { PointsNodeMaterial, WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { PhysicsEngine } from './Physics/PhysicsEngine';
+import { getPistonX, PISTON, REEF, tankVisual } from './sim/tankSceneConfig';
 
 const PARTICLE_COUNT = 100000; // Let's go for 100k now
 
@@ -24,11 +25,37 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 
 // Helpers
-scene.add(new THREE.GridHelper(50, 50, 0x222222, 0x111111));
+scene.add(new THREE.GridHelper(tankVisual.width, tankVisual.width, 0x222222, 0x111111));
 scene.add(new THREE.AxesHelper(5));
 
-// Placeholder Reef
+const tankGeo = new THREE.BoxGeometry(tankVisual.width, tankVisual.height, tankVisual.depth);
+const tankMesh = new THREE.Mesh(
+  tankGeo,
+  new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.1,
+    side: THREE.BackSide,
+  }),
+);
+tankMesh.position.y = tankVisual.centerY;
+scene.add(tankMesh);
 
+const pistonMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(PISTON.thickness, tankVisual.height, tankVisual.depth),
+  new THREE.MeshStandardMaterial({ color: 0x444444 }),
+);
+scene.add(pistonMesh);
+
+const reefMesh = new THREE.Mesh(
+  new THREE.BoxGeometry(REEF.halfExtents.x * 2, REEF.halfExtents.y * 2, REEF.halfExtents.z * 2),
+  new THREE.MeshStandardMaterial({ color: 0x222222 })
+);
+reefMesh.position.set(REEF.center.x, REEF.center.y, REEF.center.z);
+scene.add(reefMesh);
+
+
+// Ambient Light'
 scene.add(new THREE.AmbientLight(0xffffff, 1));
 
 // add directional light
@@ -36,7 +63,7 @@ const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
 directionalLight.position.set(10, 10, 10);
 scene.add(directionalLight);
 
-  const clock = new THREE.Clock();
+  const clock = new THREE.Timer();
 
 
 async function init() {
@@ -50,8 +77,8 @@ async function init() {
     // 1. Temporary "High-Visibility" Material
     const testMaterial = new PointsNodeMaterial({
       color: 0x00ffff, // Bright Cyan
-      size: 0.5,       // Large enough to see clearly
-      sizeAttenuation: true
+      size: 1,       // Large enough to see clearly
+      sizeAttenuation: false
     });
 
     // 2. Link the Buffer
@@ -74,17 +101,35 @@ async function init() {
 
 function animate() {
   requestAnimationFrame(animate);
+  clock.update();
   const delta = clock.getDelta();
+  const totalTime = clock.getElapsed();
   // Ensure physics is ready before updating
   if (physics) {
     physics.deltaTime.value = Math.min(delta, 0.033);
     controls.update();
 
-    const elapsedTime = clock.getElapsedTime();
-    physics.uTime.value = elapsedTime;
+    physics.uTime.value = totalTime;
+
+    const currentPistonX = getPistonX(totalTime);
+    physics.pistonX.value = currentPistonX;
+    pistonMesh.position.x = currentPistonX;
+
+    // --- THE SPH PIPELINE ---
+    // 1. Clear the "Post Office" (Grid Headers)
+    renderer.compute(physics.getClearGridPass());
+
+    // 2. Hash: Every particle finds its 3D cell
+    renderer.compute(physics.getGridPass());
+
+    // 3. Build List: Link particles in the same cells
+    renderer.compute(physics.getBuildListPass());
+
+    // 4. Density: Particles look at neighbors to see how "squashed" they are
+    renderer.compute(physics.getDensityPass());
 
     // Run compute then render
-    renderer.compute(physics.getComputeNode());
+    renderer.compute(physics.getComputePipeline());
     renderer.render(scene, camera);
   }
 }
