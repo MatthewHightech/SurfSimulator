@@ -68,7 +68,6 @@ export class PhysicsEngine {
   private clearGridNode!: ComputeNode;
   private gridPassNode!: ComputeNode;
   private buildListNode!: ComputeNode;
-  private densityPassNode!: ComputeNode;
   private computePipelineNode!: ComputeNode;
 
   constructor(numParticles: number) {
@@ -95,7 +94,6 @@ export class PhysicsEngine {
     this.clearGridNode = this.createClearGridPass();
     this.gridPassNode = this.createGridPass();
     this.buildListNode = this.createBuildListPass();
-    this.densityPassNode = this.createDensityPass();
     this.computePipelineNode = this.createComputePipeline();
 
     const { xMin, xMax, yMin, yMax, zSpan } = PARTICLE_SPAWN;
@@ -119,13 +117,15 @@ export class PhysicsEngine {
       const pos = this.positionBuffer.element(instanceIndex).toVar();
       const vel = this.velocityBuffer.element(instanceIndex).toVar();
 
-      const rho = this.densityBuffer.element(instanceIndex);
+      // Pressure from ρ at the *previous* frame so neighbor lists only need to be walked once
+      // per particle (same pass as fresh ρ for next frame). Typical explicit/lagged SPH on GPU.
+      const rhoOld = this.densityBuffer.element(instanceIndex);
       const rho0 = float(PHYSICS_SPH.restDensityKernel);
       const stiffness = float(PHYSICS_SPH.stiffness);
 
-      const pressure = stiffness.mul(rho.sub(rho0));
-      const over = max(rho.sub(rho0), float(0));
-      const under = max(rho0.sub(rho), float(0));
+      const pressure = stiffness.mul(rhoOld.sub(rho0));
+      const over = max(rhoOld.sub(rho0), float(0));
+      const under = max(rho0.sub(rhoOld), float(0));
 
       // IMPORTANT: A vec3(0, f(p), 0) "pressure" only pushes vertically. Under gravity
       // everything hits the floor and spreads in XZ with no lateral repulsion → a 2D pancake.
@@ -137,6 +137,8 @@ export class PhysicsEngine {
       const resY = uint(this.gridRes.y);
       const h = this.cellSize;
       const h2 = h.mul(h);
+      const poly6 = float(315.0).div(float(64.0).mul(Math.PI).mul(pow(h, 9)));
+      const rhoNew = float(0.0).toVar();
       const repulsion = vec3(0, 0, 0).toVar();
 
       Loop(
@@ -157,28 +159,27 @@ export class PhysicsEngine {
           const posJ = this.positionBuffer.element(neighborIdx).xyz;
           const delta = pos.xyz.sub(posJ);
           const r2 = lengthSq(delta);
-          If(
-            r2.lessThan(h2).and(r2.greaterThan(float(PHYSICS_SPH.neighborMinDistSq))),
-            () => {
-            const dir = normalize(delta);
-            repulsion.addAssign(dir.mul(over).div(rho0).mul(float(PHYSICS_SPH.repulsionOverGain)));
-            repulsion.addAssign(
-              dir.negate().mul(under).div(rho0).mul(float(PHYSICS_SPH.cohesionUnderGain)),
-            );
+          If(r2.lessThan(h2), () => {
+            const distTerm = h2.sub(r2);
+            rhoNew.addAssign(poly6.mul(pow(distTerm, 3)));
+            If(r2.greaterThan(float(PHYSICS_SPH.neighborMinDistSq)), () => {
+              const dir = normalize(delta);
+              repulsion.addAssign(dir.mul(over).div(rho0).mul(float(PHYSICS_SPH.repulsionOverGain)));
+              repulsion.addAssign(
+                dir.negate().mul(under).div(rho0).mul(float(PHYSICS_SPH.cohesionUnderGain)),
+              );
 
-            // This dampens the velocity difference between particle I and neighbor J
-            const velJ = this.velocityBuffer.element(neighborIdx).xyz;
-            const relativeVel = vel.xyz.sub(velJ);
-            const vDotR = relativeVel.dot(delta);
-            
-            // If particles are moving toward each other (vDotR < 0), apply friction
-            If(vDotR.lessThan(0.0), () => {
-                const viscIntensity = float(PHYSICS_SPH.viscosity); // Tune this to make water "thicker"
+              const velJ = this.velocityBuffer.element(neighborIdx).xyz;
+              const relativeVel = vel.xyz.sub(velJ);
+              const vDotR = relativeVel.dot(delta);
+
+              If(vDotR.lessThan(0.0), () => {
+                const viscIntensity = float(PHYSICS_SPH.viscosity);
                 const friction = delta.mul(vDotR).div(r2.add(float(0.01))).mul(viscIntensity);
-                repulsion.subAssign(friction); 
+                repulsion.subAssign(friction);
+              });
             });
-          },
-          );
+          });
           neighborIdx.assign(this.gridNextBuffer.element(neighborIdx));
         });
       },
@@ -195,9 +196,17 @@ export class PhysicsEngine {
       vel.x.assign(select(behindPiston, float(PISTON.shoveVelocity), vel.x));
 
       pos.y.assign(max(pos.y, float(TANK.floorY)));
+      pos.y.assign(min(pos.y, float(TANK.ceilingY)));
       vel.y.assign(
         select(
           pos.y.lessThan(float(PHYSICS_COLLISION.floorInteractionY)),
+          vel.y.mul(float(PHYSICS_COLLISION.floorVelocityYScale)),
+          vel.y,
+        ),
+      );
+      vel.y.assign(
+        select(
+          pos.y.greaterThan(float(TANK.ceilingY - 0.02)),
           vel.y.mul(float(PHYSICS_COLLISION.floorVelocityYScale)),
           vel.y,
         ),
@@ -263,6 +272,7 @@ export class PhysicsEngine {
 
       this.positionBuffer.element(instanceIndex).assign(pos);
       this.velocityBuffer.element(instanceIndex).assign(vel);
+      this.densityBuffer.element(instanceIndex).assign(rhoNew);
     });
 
     return computeLogic().compute(this.numParticles);
@@ -272,58 +282,12 @@ export class PhysicsEngine {
     return this.positionBuffer;
   }
 
-  getParticlePositionNode(): Node {
-    return this.positionBuffer.element(vertexIndex).xyz;
+  getParticleCount(): number {
+    return this.numParticles;
   }
 
-  private createDensityPass() {
-    return Fn(() => {
-      const posI = this.positionBuffer.element(instanceIndex).xyz;
-      const h = this.cellSize;
-      const h2 = h.mul(h);
-      const density = float(0.0).toVar();
-
-      const poly6 = float(315.0).div(float(64.0).mul(Math.PI).mul(pow(h, 9)));
-
-      // Neighbors within radius h usually span a 3×3×3 block of cells. Using only the
-      // home cell makes ρ far too small and breaks pressure — another pancake contributor.
-      const gridOffset = vec3(PHYSICS_GRID.originX, PHYSICS_GRID.originY, PHYSICS_GRID.originZ);
-      const gc = floor(posI.add(gridOffset).div(this.cellSize));
-      const resX = uint(this.gridRes.x);
-      const resY = uint(this.gridRes.y);
-
-      Loop(
-        { start: int(0), end: int(PHYSICS_GRID.stencilCellCount), type: 'int', condition: '<' },
-        ({ i }) => {
-        const t = float(i);
-        const ox = t.mod(3).floor().sub(1);
-        const oy = floor(t.div(3)).mod(3).floor().sub(1);
-        const oz = floor(t.div(9)).mod(3).floor().sub(1);
-        const nx = clamp(gc.x.add(ox), float(0), float(this.gridRes.x.sub(1))).toUint();
-        const ny = clamp(gc.y.add(oy), float(0), float(this.gridRes.y.sub(1))).toUint();
-        const nz = clamp(gc.z.add(oz), float(0), float(this.gridRes.z.sub(1))).toUint();
-        const neighHash = nx.add(ny.mul(resX)).add(nz.mul(resX).mul(resY));
-
-        const neighborIdx = this.gridHeaderBuffer.element(neighHash).toVar();
-
-        Loop({ start: uint(0), end: uint(PHYSICS_GRID.neighborListMax) }, () => {
-          If(neighborIdx.equal(uint(0xffffffff)), () => Break());
-
-          const posJ = this.positionBuffer.element(neighborIdx).xyz;
-          const r2 = lengthSq(posI.sub(posJ));
-
-          If(r2.lessThan(h2), () => {
-            const distTerm = h2.sub(r2);
-            density.addAssign(poly6.mul(pow(distTerm, 3)));
-          });
-
-          neighborIdx.assign(this.gridNextBuffer.element(neighborIdx));
-        });
-      },
-      );
-
-      this.densityBuffer.element(instanceIndex).assign(density);
-    })().compute(this.numParticles);
+  getParticlePositionNode(): Node {
+    return this.positionBuffer.element(vertexIndex).xyz;
   }
 
   private createGridPass() {
@@ -370,7 +334,6 @@ export class PhysicsEngine {
   public getClearGridPass() { return this.clearGridNode; }
   public getGridPass() { return this.gridPassNode; }
   public getBuildListPass() { return this.buildListNode; }
-  public getDensityPass() { return this.densityPassNode; }
   public getComputePipeline() { return this.computePipelineNode; }
 
 }

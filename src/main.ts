@@ -1,13 +1,15 @@
 import * as THREE from 'three';
-import { PointsNodeMaterial, WebGPURenderer } from 'three/webgpu';
+import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { PhysicsEngine } from './Physics/PhysicsEngine';
+import { SSFManager } from './Graphics/SSFManager'; // Import your new manager
 import { getPistonX, PISTON, REEF, tankVisual } from './sim/tankSceneConfig';
 
-const PARTICLE_COUNT = 100000; // Let's go for 100k now
+/** Default raised after merging density+forces into one compute pass (~2× less neighbor work). */
+const PARTICLE_COUNT = 220_000;
 
 let physics: PhysicsEngine;
-let particles: THREE.Points;
+let ssf: SSFManager;
 
 const renderer = new WebGPURenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
@@ -62,36 +64,16 @@ scene.add(new THREE.AmbientLight(0xffffff, 1));
 const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
 directionalLight.position.set(10, 10, 10);
 scene.add(directionalLight);
-
-  const clock = new THREE.Timer();
-
+const clock = new THREE.Timer();
 
 async function init() {
   try {
-    // CRITICAL: Wait for the GPU to be ready
     await renderer.init();
     console.log("WebGPU Initialized.");
 
     physics = new PhysicsEngine(PARTICLE_COUNT);
-
-    // 1. Temporary "High-Visibility" Material
-    const testMaterial = new PointsNodeMaterial({
-      color: 0x00ffff, // Bright Cyan
-      size: 1,       // Large enough to see clearly
-      sizeAttenuation: false
-    });
-
-    // 2. Link the Buffer
-    testMaterial.positionNode = physics.getParticlePositionNode();
-
-    // 3. Setup Geometry
-    const geometry = new THREE.BufferGeometry();
-    // Dummy attribute to define the "draw count"
-    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(PARTICLE_COUNT * 3), 3));
     
-    particles = new THREE.Points(geometry, testMaterial);
-    particles.frustumCulled = false; 
-    scene.add(particles);
+    ssf = new SSFManager(renderer, physics);
 
     animate();
   } catch (e) {
@@ -102,35 +84,34 @@ async function init() {
 function animate() {
   requestAnimationFrame(animate);
   clock.update();
+  
   const delta = clock.getDelta();
   const totalTime = clock.getElapsed();
-  // Ensure physics is ready before updating
-  if (physics) {
+
+  if (physics && ssf) {
+    // Update Uniforms
     physics.deltaTime.value = Math.min(delta, 0.033);
-    controls.update();
-
     physics.uTime.value = totalTime;
-
+    
     const currentPistonX = getPistonX(totalTime);
     physics.pistonX.value = currentPistonX;
     pistonMesh.position.x = currentPistonX;
 
-    // --- THE SPH PIPELINE ---
-    // 1. Clear the "Post Office" (Grid Headers)
+    controls.update();
+
+    // --- 1. PHYSICS COMPUTE PIPELINE ---
     renderer.compute(physics.getClearGridPass());
-
-    // 2. Hash: Every particle finds its 3D cell
     renderer.compute(physics.getGridPass());
-
-    // 3. Build List: Link particles in the same cells
     renderer.compute(physics.getBuildListPass());
-
-    // 4. Density: Particles look at neighbors to see how "squashed" they are
-    renderer.compute(physics.getDensityPass());
-
-    // Run compute then render
     renderer.compute(physics.getComputePipeline());
+
+    // --- 2. RENDER PIPELINE ---
+    // First, render the background environment (tank, piston, etc.) to the screen
     renderer.render(scene, camera);
+
+    // Then, let SSF handle the fluid. 
+    // Right now, SSF will draw over the screen with the grayscale thickness map.
+    ssf.render(renderer, camera);
   }
 }
 
