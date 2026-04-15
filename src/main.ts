@@ -2,29 +2,58 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { PhysicsEngine } from './Physics/PhysicsEngine';
-import { SSFManager } from './Graphics/SSFManager'; // Import your new manager
-import { getPistonX, PISTON, REEF, tankVisual } from './sim/tankSceneConfig';
+import { SSFManager } from './Graphics/SSFManager';
+import { PISTON, REEF, tankVisual, PHYSICS_UNIFORM_DEFAULTS } from './sim/tankSceneConfig';
+import './styles/app.css';
 
 /** Default raised after merging density+forces into one compute pass (~2× less neighbor work). */
-const PARTICLE_COUNT = 220_000;
+const PARTICLE_COUNT = 200_000;
 
 let physics: PhysicsEngine;
 let ssf: SSFManager;
 
+const viewportRoot = document.querySelector('#viewport');
+if (!(viewportRoot instanceof HTMLDivElement)) {
+  throw new Error('Missing #viewport container');
+}
+const viewportEl = viewportRoot;
+
 const renderer = new WebGPURenderer({ antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.appendChild(renderer.domElement);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+function resizeRendererToViewport() {
+  const w = Math.max(1, viewportEl.clientWidth);
+  const h = Math.max(1, viewportEl.clientHeight);
+  renderer.setSize(w, h, false);
+}
+
+resizeRendererToViewport();
+viewportEl.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x050505);
 
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-camera.position.set(20, 20, 20);
+const INITIAL_CAMERA_POSITION = new THREE.Vector3(20, 20, 20);
+const INITIAL_CONTROLS_TARGET = new THREE.Vector3(0, 0, 0);
+
+const camera = new THREE.PerspectiveCamera(
+  75,
+  viewportEl.clientWidth / Math.max(1, viewportEl.clientHeight),
+  0.1,
+  1000,
+);
+camera.position.copy(INITIAL_CAMERA_POSITION);
 
 // --- Controls ---
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
+
+const viewportObserver = new ResizeObserver(() => {
+  resizeRendererToViewport();
+  camera.aspect = viewportEl.clientWidth / Math.max(1, viewportEl.clientHeight);
+  camera.updateProjectionMatrix();
+});
+viewportObserver.observe(viewportEl);
 
 // Helpers
 scene.add(new THREE.GridHelper(tankVisual.width, tankVisual.width, 0x222222, 0x111111));
@@ -47,6 +76,7 @@ const pistonMesh = new THREE.Mesh(
   new THREE.BoxGeometry(PISTON.thickness, tankVisual.height, tankVisual.depth),
   new THREE.MeshStandardMaterial({ color: 0x444444 }),
 );
+pistonMesh.position.x = PISTON.restX;
 scene.add(pistonMesh);
 
 const reefMesh = new THREE.Mesh(
@@ -66,6 +96,53 @@ directionalLight.position.set(10, 10, 10);
 scene.add(directionalLight);
 const clock = new THREE.Timer();
 
+/** Elapsed simulation time (s), drives shader recycle / swell — resettable. */
+let simulationTime = 0;
+
+/** One-shot piston surge after “Send wave” (`performance.now()` ms). */
+let surgeStartMs: number | null = null;
+
+function getPistonXFromSurge(): number {
+  const rest = PISTON.restX;
+  if (surgeStartMs === null) return rest;
+  const elapsed = performance.now() - surgeStartMs;
+  if (elapsed >= PISTON.surgeDurationMs) {
+    surgeStartMs = null;
+    return rest;
+  }
+  const t = elapsed / PISTON.surgeDurationMs;
+  const factor = Math.sin(Math.PI * t);
+  return rest + PISTON.surgeAmplitude * factor;
+}
+
+function beginSurge(): void {
+  surgeStartMs = performance.now();
+}
+
+function cancelSurge(): void {
+  surgeStartMs = null;
+}
+
+function applyDefaultPhysicsUniforms(engine: PhysicsEngine): void {
+  engine.deltaTime.value = PHYSICS_UNIFORM_DEFAULTS.deltaTime;
+  engine.swellAmplitude.value = PHYSICS_UNIFORM_DEFAULTS.swellAmplitude;
+  engine.swellPeriod.value = PHYSICS_UNIFORM_DEFAULTS.swellPeriod;
+  engine.swellSpeed.value = PHYSICS_UNIFORM_DEFAULTS.swellSpeed;
+}
+
+function resetSimulationToInitialState(engine: PhysicsEngine): void {
+  cancelSurge();
+  simulationTime = 0;
+  pistonMesh.position.x = PISTON.restX;
+  engine.pistonX.value = PISTON.restX;
+  engine.uTime.value = 0;
+  applyDefaultPhysicsUniforms(engine);
+  engine.resetParticlesToInitialState();
+  camera.position.copy(INITIAL_CAMERA_POSITION);
+  controls.target.copy(INITIAL_CONTROLS_TARGET);
+  controls.update();
+}
+
 async function init() {
   try {
     await renderer.init();
@@ -74,6 +151,13 @@ async function init() {
     physics = new PhysicsEngine(PARTICLE_COUNT);
     
     ssf = new SSFManager(renderer, physics);
+
+    const sendWaveBtn = document.querySelector('#btn-send-wave');
+    const stillOceanBtn = document.querySelector('#btn-still-ocean');
+    const resetBtn = document.querySelector('#btn-reset');
+    sendWaveBtn?.addEventListener('click', () => beginSurge());
+    stillOceanBtn?.addEventListener('click', () => cancelSurge());
+    resetBtn?.addEventListener('click', () => resetSimulationToInitialState(physics));
 
     animate();
   } catch (e) {
@@ -86,14 +170,13 @@ function animate() {
   clock.update();
   
   const delta = clock.getDelta();
-  const totalTime = clock.getElapsed();
+  simulationTime += Math.min(delta, 0.033);
 
   if (physics && ssf) {
-    // Update Uniforms
     physics.deltaTime.value = Math.min(delta, 0.033);
-    physics.uTime.value = totalTime;
-    
-    const currentPistonX = getPistonX(totalTime);
+    physics.uTime.value = simulationTime;
+
+    const currentPistonX = getPistonXFromSurge();
     physics.pistonX.value = currentPistonX;
     pistonMesh.position.x = currentPistonX;
 

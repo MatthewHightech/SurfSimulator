@@ -4,10 +4,45 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>surf-simulator</title>
+    <meta name="description" content="GPU surf tank — SPH fluid and screen-space water in WebGPU." />
+    <title>Surf Simulator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app" class="app-shell">
+      <div class="app-shell__grid" aria-hidden="true"></div>
+
+      <header class="app-header">
+        <h1 class="app-header__title">Surf <span>Simulator</span></h1>
+        <p class="app-header__meta">
+          Real-time fluid in a wave tank: GPU SPH particles, spatial hashing, and a screen-space
+          water surface — built with Three.js and WebGPU. Orbit to explore; use the panel to send
+          waves or reset.
+        </p>
+      </header>
+
+      <div class="app-main">
+        <aside class="sidebar" aria-label="Simulation controls">
+          <p class="sidebar__heading">Modes</p>
+          <div class="sidebar__actions">
+            <button type="button" id="btn-send-wave">Send wave</button>
+            <button type="button" id="btn-still-ocean">Still ocean</button>
+            <button type="button" id="btn-reset">Reset</button>
+          </div>
+          <p class="sidebar__note">Send wave pushes the piston once. Still ocean holds it at rest.</p>
+        </aside>
+
+        <div class="viewport-wrap">
+          <div class="viewport-wrap__label">Simulation</div>
+          <div id="viewport" role="region" aria-label="Three.js surf simulation viewport"></div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -34,9 +34,12 @@ const PISTON_THICKNESS = 0.4;
 
 export const PISTON = {
   thickness: PISTON_THICKNESS,
-  /** `Math.max(0, sin(t * surgeAngularSpeed)) * surgeAmplitude` added to restX. */
+  /** Peak displacement added to {@link PISTON.restX} during a one-shot “Send wave” surge. */
   surgeAmplitude: 3.5,
+  /** Legacy continuous oscillation (no longer used by default UI — kept for reference). */
   surgeAngularSpeed: 1.0,
+  /** Duration of a single surge stroke after “Send wave” (ms). */
+  surgeDurationMs: 2200,
   /** Center X when surge factor is 0 — left face flush with inner wall at −halfWidth. */
   restX: -TANK.halfWidth + PISTON_THICKNESS * 0.5,
   /** Imparted X velocity when the piston catches a particle. */

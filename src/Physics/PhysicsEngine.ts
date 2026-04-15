@@ -43,6 +43,9 @@ import {
 
 export class PhysicsEngine {
   private readonly numParticles: number;
+  private readonly posAttr: StorageInstancedBufferAttribute;
+  private readonly velAttr: StorageInstancedBufferAttribute;
+  private readonly densityAttr: StorageInstancedBufferAttribute;
   private readonly positionBuffer: StorageBufferNode<'vec4'>;
   private readonly velocityBuffer: StorageBufferNode<'vec4'>;
   private readonly gridBuffer: StorageBufferNode<'uint'>; 
@@ -77,6 +80,7 @@ export class PhysicsEngine {
     // 1. DENSITY BUFFER (Per-particle float)
     const densityAttr = new StorageInstancedBufferAttribute(numParticles, 1);
     const gridAttr = new StorageInstancedBufferAttribute(numParticles, 1);
+    this.densityAttr = densityAttr;
     this.densityBuffer = storage(densityAttr, 'float', numParticles);
     this.gridBuffer = storage(gridAttr, 'uint', numParticles);
 
@@ -88,6 +92,8 @@ export class PhysicsEngine {
 
     const posAttr = new StorageInstancedBufferAttribute(numParticles, 4);
     const velAttr = new StorageInstancedBufferAttribute(numParticles, 4);
+    this.posAttr = posAttr;
+    this.velAttr = velAttr;
     this.positionBuffer = storage(posAttr, 'vec4', numParticles);
     this.velocityBuffer = storage(velAttr, 'vec4', numParticles);
 
@@ -96,20 +102,33 @@ export class PhysicsEngine {
     this.buildListNode = this.createBuildListPass();
     this.computePipelineNode = this.createComputePipeline();
 
+    this.seedParticlesFromSpawnBox();
+  }
+
+  /** Same random spawn as load + zero lagged density buffer. */
+  resetParticlesToInitialState(): void {
+    this.seedParticlesFromSpawnBox();
+  }
+
+  private seedParticlesFromSpawnBox(): void {
     const { xMin, xMax, yMin, yMax, zSpan } = PARTICLE_SPAWN;
     const xRange = xMax - xMin;
     const yRange = yMax - yMin;
-
-    for (let i = 0; i < numParticles; i++) {
-      posAttr.setXYZW(
+    const n = this.numParticles;
+    for (let i = 0; i < n; i++) {
+      this.posAttr.setXYZW(
         i,
         xMin + Math.random() * xRange,
         yMin + Math.random() * yRange,
         (Math.random() - 0.5) * zSpan,
         1,
       );
-      velAttr.setXYZW(i, 0, 0, 0, 0);
+      this.velAttr.setXYZW(i, 0, 0, 0, 0);
     }
+    this.posAttr.needsUpdate = true;
+    this.velAttr.needsUpdate = true;
+    this.densityAttr.array.fill(0);
+    this.densityAttr.needsUpdate = true;
   }
 
   private createComputePipeline(): ComputeNode {
